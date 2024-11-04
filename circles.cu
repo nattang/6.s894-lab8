@@ -44,7 +44,6 @@ class GpuMemoryPool {
   private:
     std::vector<void *> allocations_;
     std::vector<size_t> capacities_;
-    std::vector<bool> zero_on_reset_;
     size_t next_idx_ = 0;
 };
 
@@ -65,6 +64,15 @@ void render_cpu(
     float *img_red,
     float *img_green,
     float *img_blue) {
+
+    // Initialize background to white
+    for (int32_t pixel_idx = 0; pixel_idx < width * height; pixel_idx++) {
+        img_red[pixel_idx] = 1.0f;
+        img_green[pixel_idx] = 1.0f;
+        img_blue[pixel_idx] = 1.0f;
+    }
+
+    // Render circles
     for (int32_t i = 0; i < n_circle; i++) {
         float c_x = circle_x[i];
         float c_y = circle_y[i];
@@ -162,8 +170,8 @@ void *GpuMemoryPool::alloc(size_t size) {
 
 void GpuMemoryPool::reset() {
     next_idx_ = 0;
-    for (auto ptr : allocations_) {
-        CUDA_CHECK(cudaMemset(ptr, 0, capacities_.at(next_idx_)));
+    for (int32_t i = 0; i < allocations_.size(); i++) {
+        CUDA_CHECK(cudaMemset(allocations_.at(i), 0, capacities_.at(i)));
     }
 }
 
@@ -254,9 +262,9 @@ Results run_config(Mode mode, Scene const &scene) {
     auto img_expected = Image{
         scene.width,
         scene.height,
-        std::vector<float>(scene.height * scene.width, 1.0f),
-        std::vector<float>(scene.height * scene.width, 1.0f),
-        std::vector<float>(scene.height * scene.width, 1.0f)};
+        std::vector<float>(scene.height * scene.width, 0.0f),
+        std::vector<float>(scene.height * scene.width, 0.0f),
+        std::vector<float>(scene.height * scene.width, 0.0f)};
 
     render_cpu(
         scene.width,
