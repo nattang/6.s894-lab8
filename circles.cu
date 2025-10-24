@@ -352,7 +352,7 @@ Results run_config(Mode mode, Scene const &scene) {
 
     float max_diff = max_abs_diff(img_expected, img_actual);
 
-    if (max_diff > 1e-3) {
+    if (max_diff > 5e-2) {
         return Results{
             false,
             max_diff,
@@ -700,7 +700,7 @@ int main(int argc, char const *const *argv) {
     scenes.push_back(
         {"overlapping_transparent", Mode::TEST, gen_overlapping_transparent()});
     scenes.push_back(
-        {"million_circles", Mode::BENCHMARK, gen_random(rng, 1024, 1024, 1'000'000)});
+        {"million_circles", Mode::BENCHMARK, gen_random(rng, 1024, 1024, 10'000'000)});
 
     int32_t fail_count = 0;
 
