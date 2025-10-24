@@ -408,7 +408,7 @@ Scene gen_random(Rng &rng, int32_t width, int32_t height, int32_t n_circle) {
         0x2874aa,
     };
     auto color_idx_dist = std::uniform_int_distribution<int>(0, colors.size() - 1);
-    auto alpha_dist = std::uniform_real_distribution<float>(0.0f, 0.5f);
+    auto alpha_dist = std::uniform_real_distribution<float>(0.0f, 0.3f);
 
     int32_t fog_interval = n_circle / 10;
     float fog_alpha = 0.2;
@@ -700,7 +700,7 @@ int main(int argc, char const *const *argv) {
     scenes.push_back(
         {"overlapping_transparent", Mode::TEST, gen_overlapping_transparent()});
     scenes.push_back(
-        {"million_circles", Mode::BENCHMARK, gen_random(rng, 1024, 1024, 10'000'000)});
+        {"ten_million_circles", Mode::BENCHMARK, gen_random(rng, 1024, 1024, 10'000'000)});
 
     int32_t fail_count = 0;
 
