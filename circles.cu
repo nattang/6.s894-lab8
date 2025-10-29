@@ -117,9 +117,10 @@ void render_cpu(
 #define TILE_HEIGHT 32
 
 #define CIRCLES_PER_BLOCK 256
-#define PAIRS_PER_BLOCK 256
+#define THREADS_PER_BLOCK 1024    // one thread per pixel
 #define CIRCLES_PER_THREAD_SCAN 4 // TODO: maybe lift this for organize_circles kernel too
 #define SPINE_VALS_PER_THREAD 4
+#define CIRCLE_BATCH_SIZE 4096
 
 namespace circles_gpu {
 
@@ -179,38 +180,6 @@ __global__ void render_gpu_naive(
     }
 }
 
-__global__ void organize_circles(
-    int32_t width,
-    int32_t height,
-    int32_t n_circle,
-    float const *circle_x,      // pointer to GPU memory
-    float const *circle_y,      // pointer to GPU memory
-    float const *circle_radius, // pointer to GPU memory
-    uint32_t *circle_to_tile_count) {
-
-    int32_t circle_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (circle_idx >= n_circle) {
-        return;
-    }
-    float c_x = circle_x[circle_idx];
-    float c_y = circle_y[circle_idx];
-    float c_radius = circle_radius[circle_idx];
-
-    // get bbox coordinates in tile space
-    int box_x_min = max(int((c_x - c_radius) / TILE_WIDTH), 0);
-    int box_x_max = min(int((c_x + c_radius) / TILE_WIDTH), (width - 1) / TILE_WIDTH);
-    int box_y_min = max(int((c_y - c_radius) / TILE_HEIGHT), 0);
-    int box_y_max = min(int((c_y + c_radius) / TILE_HEIGHT), (height - 1) / TILE_HEIGHT);
-
-    uint32_t count = 0;
-    for (int box_y = box_y_min; box_y <= box_y_max; box_y++) {
-        for (int box_x = box_x_min; box_x <= box_x_max; box_x++) {
-            count++;
-        }
-    }
-    circle_to_tile_count[circle_idx] = count;
-}
-
 __global__ void compute_tile_mask(
     int32_t width,
     int32_t height,
@@ -220,7 +189,7 @@ __global__ void compute_tile_mask(
     float const *circle_x, // pointer to GPU memory
     float const *circle_y, // pointer to GPU memory
     float const *circle_radius,
-    uint32_t *mask) {
+    int8_t *mask) {
 
     int32_t circle_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (circle_idx >= n_circle) {
@@ -239,9 +208,132 @@ __global__ void compute_tile_mask(
     for (int box_y = box_y_min; box_y <= box_y_max; box_y++) {
         for (int box_x = box_x_min; box_x <= box_x_max; box_x++) {
             int tile_id = box_y * num_tiles_x + box_x;
-            mask[tile_id * n_circles + circle_idx] = 1;
+            mask[tile_id * n_circle + circle_idx] = 1;
         }
     }
+}
+
+__global__ void tile_scan_and_render(
+    int32_t width,
+    int32_t height,
+    int32_t n_circle,
+    int8_t *mask,               // pointer to GPU memory
+    float const *circle_x,      // pointer to GPU memory
+    float const *circle_y,      // pointer to GPU memory
+    float const *circle_radius, // pointer to GPU memory
+    float const *circle_red,    // pointer to GPU memory
+    float const *circle_green,  // pointer to GPU memory
+    float const *circle_blue,   // pointer to GPU memory
+    float const *circle_alpha,  // pointer to GPU memory
+    float *img_red,             // pointer to GPU memory
+    float *img_green,           // pointer to GPU memory
+    float *img_blue             // pointer to GPU memory
+) {
+    extern __shared__ __align__(16) uint32_t shmem_raw[]; // OK
+    uint32_t *shmem = reinterpret_cast<uint32_t *>(shmem_raw);
+    uint32_t *circle_list = shmem + THREADS_PER_BLOCK;
+
+    int threads_per_block = blockDim.x;
+    int threadId = threadIdx.x;
+    int mask_offset = blockIdx.x * n_circle;
+
+    uint32_t vals[SPINE_VALS_PER_THREAD];
+    for (int i = 0; i < SPINE_VALS_PER_THREAD; i++) {
+        int idx = mask_offset + threadId * SPINE_VALS_PER_THREAD + i;
+        if (threadId * SPINE_VALS_PER_THREAD + i < n_circle) {
+            vals[i] = mask[idx];
+        } else {
+            vals[i] = 0;
+        }
+    }
+    for (int i = 1; i < SPINE_VALS_PER_THREAD; i++) {
+        vals[i] = vals[i - 1] + vals[i];
+    }
+
+    uint32_t thread_sum = vals[SPINE_VALS_PER_THREAD - 1];
+    shmem[threadId] = thread_sum;
+
+    // scan across shmem
+    for (int i = 1; i < threads_per_block; i <<= 1) {
+        __syncthreads();
+        uint32_t cur_val = shmem[threadId];
+        if (threadId >= i) {
+            cur_val = shmem[threadId - i] + cur_val;
+        }
+        __syncthreads();
+        shmem[threadId] = cur_val;
+    }
+    __syncthreads();
+    int num_block_circles = shmem[threads_per_block - 1];
+
+    uint32_t threadPrefix = 0;
+    if (threadId > 0) {
+        threadPrefix = shmem[threadId - 1];
+    }
+    for (int i = 0; i < SPINE_VALS_PER_THREAD; i++) {
+        vals[i] = threadPrefix + vals[i];
+    }
+
+    // write circle list
+    for (int i = 0; i < SPINE_VALS_PER_THREAD; i++) {
+        int idx = mask_offset + threadId * SPINE_VALS_PER_THREAD + i;
+        if (threadId * SPINE_VALS_PER_THREAD + i >= n_circle) {
+            continue;
+        }
+        if (mask[idx]) {
+            int write_idx = vals[i] - 1;
+            circle_list[write_idx] = idx % n_circle;
+        }
+    }
+    __syncthreads();
+
+    int tile_offset = blockIdx.x * threads_per_block;
+    int t_x = threadId % TILE_WIDTH;
+    int t_y = threadId / TILE_WIDTH;
+
+    int num_tiles_x = CEIL_DIV(width, TILE_WIDTH);
+    int tile_x = blockIdx.x % num_tiles_x;
+    int tile_y = blockIdx.x / num_tiles_x;
+    float x = tile_x * TILE_WIDTH + t_x;
+    float y = tile_y * TILE_HEIGHT + t_y;
+    int pixel_idx = y * width + x;
+
+    if (pixel_idx >= width * height) {
+        return;
+    }
+
+    float pixel_red = img_red[pixel_idx] == 0 ? 1.0f : img_red[pixel_idx];
+    float pixel_green = img_green[pixel_idx] == 0 ? 1.0f : img_green[pixel_idx];
+    float pixel_blue = img_blue[pixel_idx] == 0 ? 1.0f : img_blue[pixel_idx];
+
+    for (int32_t i = 0; i < num_block_circles; i++) {
+        // if (threadId == 0 && width == 256 && height == 256) {
+        //     printf("tile (%d, %d) circle %d/%d\n", tile_x, tile_y, i,
+        //     num_block_circles);
+        // }
+        int c_idx = circle_list[i];
+        float c_x = circle_x[c_idx];
+        float c_y = circle_y[c_idx];
+        float c_radius = circle_radius[c_idx];
+        float pixel_alpha = circle_alpha[c_idx];
+
+        // check if pixel is in circle
+        float dx = x - c_x;
+        float dy = y - c_y;
+
+        if (!(dx * dx + dy * dy < c_radius * c_radius)) {
+            continue;
+        }
+
+        pixel_red = circle_red[c_idx] * pixel_alpha + pixel_red * (1.0f - pixel_alpha);
+        pixel_green =
+            circle_green[c_idx] * pixel_alpha + pixel_green * (1.0f - pixel_alpha);
+        pixel_blue = circle_blue[c_idx] * pixel_alpha + pixel_blue * (1.0f - pixel_alpha);
+    }
+
+    img_red[pixel_idx] = pixel_red;
+    img_green[pixel_idx] = pixel_green;
+    img_blue[pixel_idx] = pixel_blue;
 }
 
 __global__ void upstream_reduction(
@@ -560,175 +652,59 @@ void launch_render(
 
     int32_t num_tiles_x = CEIL_DIV(width, TILE_WIDTH);
     int32_t num_tiles_y = CEIL_DIV(height, TILE_HEIGHT);
+    int32_t num_tiles = num_tiles_x * num_tiles_y;
 
-    size_t mask_size = n_circle * sizeof(uint32_t);
-    uint32_t *mask = reinterpret_cast<uint32_t *>(memory_pool.alloc(mask_size));
-    dim3 gridDim(CEIL_DIV(n_circle, CIRCLES_PER_BLOCK));
+    size_t mask_size = num_tiles * CIRCLE_BATCH_SIZE * sizeof(int8_t);
+    int8_t *mask = reinterpret_cast<int8_t *>(memory_pool.alloc(mask_size));
+    dim3 gridDim(CEIL_DIV(CIRCLE_BATCH_SIZE, CIRCLES_PER_BLOCK));
     dim3 blockDim(CIRCLES_PER_BLOCK);
 
-    size_t blocksums_size = gridDim.x * sizeof(uint32_t);
-    uint32_t *blocksums = reinterpret_cast<uint32_t *>(memory_pool.alloc(blocksums_size));
+    // for (int circle_start = 0; circle_start < n_circle;
+    //      circle_start += CIRCLE_BATCH_SIZE) {
+    int circle_start = 0;
+    int circle_end = MIN(circle_start + CIRCLE_BATCH_SIZE, n_circle);
+    int batch_size = circle_end - circle_start;
 
-    uint32_t shmem_size_bytes = CIRCLES_PER_BLOCK * sizeof(uint32_t);
-    dim3 gridDimScan(CEIL_DIV(n_circle, CIRCLES_PER_BLOCK * CIRCLES_PER_THREAD_SCAN));
-    dim3 blockDimScan(CIRCLES_PER_BLOCK);
-    upstream_reduction<<<gridDimScan, blockDimScan, shmem_size_bytes>>>(
-        n_circle,
-        circle_to_tile_count,
-        blocksums);
-
-    dim3 spineBlockDim(CEIL_DIV(gridDimScan.x, SPINE_VALS_PER_THREAD));
-    size_t spine_shmem_size_bytes = spineBlockDim.x * sizeof(uint32_t);
-    spine_scan<<<1, spineBlockDim, spine_shmem_size_bytes>>>(blocksums);
-
-    downstream_scan<<<gridDimScan, blockDimScan, shmem_size_bytes>>>(
-        circle_to_tile_count,
-        blocksums);
-
-    // if (width == 256) {
-    //     printf("circle_to_tile_count[0..3]: ");
-    //     uint32_t host_counts[4];
-    //     CUDA_CHECK(cudaMemcpy(
-    //         host_counts,
-    //         circle_to_tile_count,
-    //         4 * sizeof(uint32_t),
-    //         cudaMemcpyDeviceToHost));
-    //     for (int i = 0; i < 4; i++) {
-    //         printf("%u ", host_counts[i]);
-    //     }
-    //     printf("\n");
-    // }
-
-    build_circle_tile_pairs<<<gridDim, blockDim>>>(
+    compute_tile_mask<<<gridDim, blockDim>>>(
         width,
         height,
-        n_circle,
-        circle_to_tile_count,
-        circle_ids,
-        tile_ids,
-        circle_x,
-        circle_y,
-        circle_radius);
+        batch_size,
+        num_tiles_x,
+        num_tiles_y,
+        circle_x + circle_start,
+        circle_y + circle_start,
+        circle_radius + circle_start,
+        mask);
 
-    // if (width == 256) {
-    //     printf("circle_ids[0..15]: ");
-    //     uint32_t host_circle_ids[16];
-    //     CUDA_CHECK(cudaMemcpy(
-    //         host_circle_ids,
-    //         circle_ids,
-    //         16 * sizeof(uint32_t),
-    //         cudaMemcpyDeviceToHost));
-    //     for (int i = 0; i < 16; i++) {
-    //         printf("%u ", host_circle_ids[i]);
-    //     }
-    //     printf("\n");
-    //     printf("tile_ids[0..15]: ");
-    //     uint32_t host_tile_ids[16];
-    //     CUDA_CHECK(cudaMemcpy(
-    //         host_tile_ids,
-    //         tile_ids,
-    //         16 * sizeof(uint32_t),
-    //         cudaMemcpyDeviceToHost));
-    //     for (int i = 0; i < 16; i++) {
-    //         printf("%u ", host_tile_ids[i]);
-    //     }
-    //     printf("\n");
-    // }
-
-    // radix sort
-    size_t tile_counts_size = num_tiles_x * num_tiles_y * sizeof(float);
-    uint32_t *tile_to_circle_count =
-        reinterpret_cast<uint32_t *>(memory_pool.alloc(tile_counts_size));
-    int num_pairs;
-    CUDA_CHECK(cudaMemcpy(
-        &num_pairs,
-        &circle_to_tile_count[n_circle - 1],
-        sizeof(uint32_t),
-        cudaMemcpyDeviceToHost));
-
-    // count
-    dim3 countBlockDim(CEIL_DIV(num_pairs, PAIRS_PER_BLOCK));
-    dim3 countGridDim(PAIRS_PER_BLOCK);
-    size_t count_shmem_size_bytes = num_tiles_x * num_tiles_y * sizeof(uint32_t);
-    count_circle_in_tile<<<countBlockDim, countGridDim, count_shmem_size_bytes>>>(
-        num_pairs,
-        num_tiles_x * num_tiles_y,
-        circle_ids,
-        tile_ids,
-        tile_to_circle_count);
+    dim3 gridDim2(num_tiles);
+    dim3 blockDim2(THREADS_PER_BLOCK);
+    size_t shmem_size_bytes =
+        THREADS_PER_BLOCK * SPINE_VALS_PER_THREAD * sizeof(uint32_t) +
+        MIN(n_circle, CIRCLE_BATCH_SIZE) * sizeof(uint32_t);
 
     if (width == 256) {
-        printf("tile_to_circle_count[0..15]: ");
-        uint32_t host_tile_counts[16];
-        CUDA_CHECK(cudaMemcpy(
-            host_tile_counts,
-            tile_to_circle_count,
-            16 * sizeof(uint32_t),
-            cudaMemcpyDeviceToHost));
-        for (int i = 0; i < 16; i++) {
-            printf("%u ", host_tile_counts[i]);
-        }
-        printf("\n");
+        printf(
+            "launching with gridDim2=%d, blockDim2=%d, shmem_size_bytes=%zu\n",
+            gridDim2.x,
+            blockDim2.x,
+            shmem_size_bytes);
     }
 
-    // scan
-    dim3 pairsScanGridDim = dim3(
-        CEIL_DIV(num_tiles_x * num_tiles_y, CIRCLES_PER_BLOCK * CIRCLES_PER_THREAD_SCAN));
-    dim3 pairsScanBlockDim = dim3(CIRCLES_PER_BLOCK);
-    upstream_reduction<<<pairsScanGridDim, pairsScanBlockDim, shmem_size_bytes>>>(
-        num_tiles_x * num_tiles_y,
-        tile_to_circle_count,
-        blocksums);
-
-    spine_scan<<<1, spineBlockDim, spine_shmem_size_bytes>>>(blocksums);
-    downstream_scan<<<pairsScanGridDim, pairsScanBlockDim, shmem_size_bytes>>>(
-        tile_to_circle_count,
-        blocksums);
-
-    if (width == 256) {
-        printf("tile_to_circle_count[0..15]: ");
-        uint32_t host_tile_counts[16];
-        CUDA_CHECK(cudaMemcpy(
-            host_tile_counts,
-            tile_to_circle_count,
-            16 * sizeof(uint32_t),
-            cudaMemcpyDeviceToHost));
-        for (int i = 0; i < 16; i++) {
-            printf("%u ", host_tile_counts[i]);
-        }
-        printf("\n");
-    }
-
-    uint32_t *sorted_circle_ids =
-        reinterpret_cast<uint32_t *>(memory_pool.alloc(circle_ids_size));
-    uint32_t *sorted_tile_ids =
-        reinterpret_cast<uint32_t *>(memory_pool.alloc(tile_ids_size));
-
-    // reorder
-
-    // if (width == 256) {
-    //     printf("circle_ids[0..31]: ");
-    //     uint32_t host_circle_ids[32];
-    //     CUDA_CHECK(cudaMemcpy(
-    //         host_circle_ids,
-    //         circle_ids,
-    //         32 * sizeof(uint32_t),
-    //         cudaMemcpyDeviceToHost));
-    //     for (int i = 0; i < 32; i++) {
-    //         printf("%u ", host_circle_ids[i]);
-    //     }
-    //     printf("\n");
-    //     printf("tile_ids[0..31]: ");
-    //     uint32_t host_tile_ids[32];
-    //     CUDA_CHECK(cudaMemcpy(
-    //         host_tile_ids,
-    //         tile_ids,
-    //         32 * sizeof(uint32_t),
-    //         cudaMemcpyDeviceToHost));
-    //     for (int i = 0; i < 32; i++) {
-    //         printf("%u ", host_tile_ids[i]);
-    //     }
-    //     printf("\n");
+    tile_scan_and_render<<<gridDim2, blockDim2, shmem_size_bytes>>>(
+        width,
+        height,
+        batch_size,
+        mask,
+        circle_x + circle_start,
+        circle_y + circle_start,
+        circle_radius + circle_start,
+        circle_red + circle_start,
+        circle_green + circle_start,
+        circle_blue + circle_start,
+        circle_alpha + circle_start,
+        img_red,
+        img_green,
+        img_blue);
     // }
 }
 
