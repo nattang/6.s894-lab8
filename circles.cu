@@ -230,7 +230,6 @@ __global__ void spine_scan(
     for (int i = 1; i < SPINE_VALS_THREAD; i++) {
         vals[i] = vals[i - 1] + vals[i];
     }
-
     uint32_t thread_sum = vals[SPINE_VALS_THREAD - 1];
     shmem[threadId] = thread_sum;
 
@@ -250,7 +249,6 @@ __global__ void spine_scan(
     if (threadId > 0) {
         threadPrefix = shmem[threadId - 1];
     }
-
     for (int i = 0; i < SPINE_VALS_THREAD; i++) {
         vals[i] = threadPrefix + vals[i];
     }
@@ -259,6 +257,8 @@ __global__ void spine_scan(
         int idx = threadId * SPINE_VALS_THREAD + i;
         blocksums[idx] = vals[i];
     }
+    __syncthreads();
+
 }
 
 __global__ void downstream_scan(
@@ -286,7 +286,6 @@ __global__ void downstream_scan(
     for (int i = 1; i < SCAN_VALS_THREAD; i++) {
         vals[i] = vals[i - 1] + vals[i];
     }
-
     uint32_t thread_sum = vals[SCAN_VALS_THREAD - 1];
     shmem[threadId] = thread_sum;
 
@@ -336,6 +335,32 @@ __global__ void downstream_scan(
     // first thread writes total count
     if (blockIdx.x == 0 && threadId == 0) {
         tile_to_circle_count[tile_id] = blocksums[num_blocks - 1];
+    }
+}
+
+__global__ void warp_reduction(
+    int32_t n_circle,
+    int32_t num_tiles,
+    uint32_t *tile_to_circle_count,
+    int32_t *total_circles) {
+    int threadId = threadIdx.x;
+    uint32_t thread_sum = 0;
+    for (int i = threadId; i < n_circle; i += blockDim.x) {
+        if (i >= num_tiles) {
+            break;
+        }
+        thread_sum += tile_to_circle_count[i];
+    }
+
+    // reduce within warp
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        thread_sum += __shfl_down_sync(0xffffffff, thread_sum, offset);
+    }
+
+    // write result
+    if (threadId == 0) {
+        *total_circles = thread_sum;
+        printf("Total circles across all tiles: %d\n", thread_sum);
     }
 }
 
@@ -518,14 +543,14 @@ void launch_render(
     int32_t num_blocks_scan = CEIL_DIV(n_circle, THREADS_PER_BLOCK * SCAN_VALS_THREAD);
     dim3 upstreamGridDim(num_blocks_scan);
     dim3 upstreamBlockDim(THREADS_PER_BLOCK);
-    size_t upstream_shmem_size_bytes = THREADS_PER_BLOCK * sizeof(uint32_t);
+    size_t scan_shmem_size_bytes = THREADS_PER_BLOCK * sizeof(uint32_t);
 
     // temp workspace for upstream scan
     size_t upstream_workspace_size = upstreamGridDim.x * sizeof(uint32_t);
     uint32_t *upstream_workspace =
         reinterpret_cast<uint32_t *>(memory_pool.alloc(upstream_workspace_size));
 
-    dim3 spineGridDim(CEIL_DIV(upstreamGridDim.x, THREADS_PER_BLOCK));
+    dim3 spineGridDim(1);
     dim3 spineBlockDim(THREADS_PER_BLOCK);
 
     for (int32_t tile_x = 0; tile_x < num_tiles_x; tile_x++) {
@@ -536,22 +561,28 @@ void launch_render(
             upstream_reduction<<<
                 upstreamGridDim,
                 upstreamBlockDim,
-                upstream_shmem_size_bytes>>>(
+                scan_shmem_size_bytes>>>(
                 n_circle,
                 mask + tile_id * n_circle,
                 upstream_workspace);
 
             // spine scan
-            spine_scan<<<
-                spineGridDim,
-                spineBlockDim,
-                THREADS_PER_BLOCK * sizeof(uint32_t)>>>(upstream_workspace);
+            spine_scan<<<spineGridDim, spineBlockDim, scan_shmem_size_bytes>>>(
+                upstream_workspace);
+
+            // int32_t num_circles;
+            // CUDA_CHECK(cudaMemcpy(
+            //     &num_circles,
+            //     tile_circle_count + tile_id,
+            //     sizeof(uint32_t),
+            //     cudaMemcpyDeviceToHost));
+
+            // uint32_t *circle_list =
+            //     reinterpret_cast<uint32_t *>(memory_pool.alloc(num_circles *
+            //     sizeof(uint32_t)));
 
             // downstream scan
-            downstream_scan<<<
-                upstreamGridDim,
-                upstreamBlockDim,
-                upstream_shmem_size_bytes>>>(
+            downstream_scan<<<upstreamGridDim, upstreamBlockDim, scan_shmem_size_bytes>>>(
                 n_circle,
                 upstreamGridDim.x,
                 tile_id,
@@ -561,6 +592,26 @@ void launch_render(
                 tile_circle_count);
         }
     }
+
+    // scan over all tiles to get total circle count
+    // int32_t *total_circles_ptr =
+    //     reinterpret_cast<int32_t *>(memory_pool.alloc(sizeof(int32_t)));
+    // warp_reduction<<<1, THREADS_PER_BLOCK>>>( // assumes num_blocks < THREADS_PER_BLOCK
+    //     n_circle,
+    //     num_tiles,
+    //     tile_circle_count,
+    //     total_circles_ptr
+    // );
+    // uint32_t total_block_circles;
+    // CUDA_CHECK(cudaMemcpy(
+    //     &total_block_circles,
+    //     total_circles_ptr,
+    //     sizeof(uint32_t),
+    //     cudaMemcpyDeviceToHost));
+    // size_t tile_to_circle_list_size = total_block * sizeof(uint32_t);
+    // uint32_t *tile_to_circle_list =
+    //     reinterpret_cast<uint32_t *>(memory_pool.alloc(tile_to_circle_list_size));
+
     // render tiles
     dim3 renderGridDim(num_tiles);
     dim3 renderBlockDim(THREADS_PER_BLOCK);
@@ -581,38 +632,6 @@ void launch_render(
         img_red,
         img_green,
         img_blue);
-
-    // dim3 gridDim2(num_tiles);
-    // dim3 blockDim2(THREADS_PER_BLOCK);
-    // size_t shmem_size_bytes =
-    //     THREADS_PER_BLOCK * SPINE_VALS_THREAD * sizeof(uint32_t) +
-    //     MIN(n_circle, CIRCLE_BATCH_SIZE) * sizeof(uint32_t);
-    // CUDA_CHECK(cudaFuncSetAttribute(
-    //     tile_scan_and_render,
-    //     cudaFuncAttributeMaxDynamicSharedMemorySize,
-    //     shmem_size_bytes));
-    // tile_scan_and_render<<<gridDim2, blockDim2, shmem_size_bytes>>>(
-    //     width,
-    //     height,
-    //     batch_size,
-    //     mask,
-    //     circle_x + circle_start,
-    //     circle_y + circle_start,
-    //     circle_radius + circle_start,
-    //     circle_red + circle_start,
-    //     circle_green + circle_start,
-    //     circle_blue + circle_start,
-    //     circle_alpha + circle_start,
-    //     img_red,
-    //     img_green,
-    //     img_blue);
-
-    cudaError err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        std::cerr << "CUDA error in launch_render: " << cudaGetErrorString(err)
-                  << std::endl;
-        exit(1);
-    }
 }
 
 } // namespace circles_gpu
