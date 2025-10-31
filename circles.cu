@@ -495,13 +495,8 @@ __global__ void render_kernel(
             }
             for (int x = 0; x < THREAD_TILE_DIM; x++) {
                 for (int y = 1; y < THREAD_TILE_DIM; y++) {
-
                     int pixel_x = base_x + x;
                     int pixel_y = base_y + y;
-                    if (pixel_y >= height) { // this check does nothing but idk
-                                             // keeping it is faster..
-                        break;
-                    }
 
                     int pixel_idx = pixel_y * width + pixel_x;
 
