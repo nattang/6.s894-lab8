@@ -119,11 +119,13 @@ void render_cpu(
 #define TILE_HEIGHT 128
 
 #define THREADS_PER_WARP 32
+#define WARPS_PER_BLOCK 32
+#define CIRCLES_PER_THREAD 4
 #define CIRCLES_PER_BLOCK 1024
 #define THREADS_PER_BLOCK 1024 // one thread per pixel
 #define SCAN_VALS_THREAD 4     // TODO: maybe lift this for organize_circles kernel too
 #define SPINE_VALS_THREAD 8
-#define CIRCLE_BATCH_SIZE 8192
+#define CIRCLE_BATCH_SIZE 10000
 
 #define PIXELS_PER_THREAD TILE_WIDTH *TILE_HEIGHT / THREADS_PER_BLOCK
 #define THREAD_TILE_DIM 4 // hardcoded
@@ -187,7 +189,7 @@ __global__ void upstream_reduction(
         vals[i] = (idx < n_circles) ? mask[idx] : 0;
         thread_total += vals[i];
     }
-// reduce within warp
+    // reduce within warp
 #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         thread_total += __shfl_down_sync(0xffffffff, thread_total, offset);
@@ -213,8 +215,10 @@ __global__ void upstream_reduction(
 }
 
 __global__ void spine_scan(
-    uint32_t *blocksums // pointer to GPU memory
-) {
+    int32_t num_blocks,
+    int32_t tile_id,
+    uint32_t *blocksums, // pointer to GPU memory
+    uint32_t *tile_to_circle_count) {
     extern __shared__ __align__(16) uint32_t shmem_raw[]; // OK
     uint32_t *shmem = reinterpret_cast<uint32_t *>(shmem_raw);
 
@@ -271,16 +275,21 @@ __global__ void spine_scan(
         int idx = threadId * SPINE_VALS_THREAD + i;
         blocksums[idx] = vals[i];
     }
+    __syncthreads();
+
+    // first thread writes total count
+    if (threadId == 0) {
+        tile_to_circle_count[tile_id] = blocksums[num_blocks - 1];
+    }
 }
 
 __global__ void downstream_scan(
     int32_t n_circle,
     int32_t num_blocks,
     int32_t tile_id,
-    int8_t *mask,        // pointer to GPU memory
-    uint32_t *blocksums, // pointer to GPU memory
-    uint32_t *tile_to_circle_list,
-    uint32_t *tile_to_circle_count) // pointer to GPU memory
+    int8_t *mask,                  // pointer to GPU memory
+    uint32_t *blocksums,           // pointer to GPU memory
+    uint32_t *tile_to_circle_list) // pointer to GPU memory
 {
     extern __shared__ __align__(16) uint32_t shmem_raw[]; // OK
     uint32_t *shmem = reinterpret_cast<uint32_t *>(shmem_raw);
@@ -288,6 +297,8 @@ __global__ void downstream_scan(
     int threads_per_block = blockDim.x;
     int block_offset = blockIdx.x * threads_per_block * SCAN_VALS_THREAD;
     int threadId = threadIdx.x;
+    int lane = threadId % THREADS_PER_WARP;
+    int warpId = threadId / THREADS_PER_WARP;
 
     // load from global memory & perform thread scan
     uint32_t vals[SCAN_VALS_THREAD];
@@ -299,28 +310,37 @@ __global__ void downstream_scan(
         vals[i] = vals[i - 1] + vals[i];
     }
 
-    uint32_t thread_sum = vals[SCAN_VALS_THREAD - 1];
-    shmem[threadId] = thread_sum;
-
-    // scan across shmem (across all warps in the block)
-    for (int i = 1; i < threads_per_block; i <<= 1) {
-        __syncthreads();
-        uint32_t cur_val = shmem[threadId];
-        if (threadId >= i) {
-            cur_val = shmem[threadId - i] + cur_val;
-        }
-        __syncthreads();
-        shmem[threadId] = cur_val;
+    // scan within warp
+    uint32_t thread_total = vals[SCAN_VALS_THREAD - 1];
+    uint32_t warp_prefix = thread_total;
+    for (int offset = 1; offset < THREADS_PER_WARP; offset <<= 1) {
+        uint32_t n = __shfl_up_sync(0xFFFFFFFF, warp_prefix, offset);
+        if (lane >= offset)
+            warp_prefix += n;
+    }
+    if (lane == THREADS_PER_WARP - 1) {
+        shmem[warpId] = warp_prefix; // last lane holds warp sum
     }
     __syncthreads();
 
-    // fix up each thread in block
-    uint32_t threadPrefix = 0;
-    if (threadId > 0) { // mask first warp
-        threadPrefix = shmem[threadId - 1];
+    // scan across warps
+    if (warpId == 0) {
+        uint32_t warp_sum = (lane < WARPS_PER_BLOCK) ? shmem[lane] : 0;
+        for (int offset = 1; offset < WARPS_PER_BLOCK; offset <<= 1) {
+            uint32_t n = __shfl_up_sync(0xFFFFFFFF, warp_sum, offset);
+            if (lane >= offset)
+                warp_sum += n;
+        }
+        if (threadId < 32)
+            shmem[lane] = warp_sum;
+    }
+    __syncthreads();
+
+    if (warpId > 0) {
+        warp_prefix += shmem[warpId - 1];
     }
     for (int i = 0; i < SCAN_VALS_THREAD; i++) {
-        vals[i] = threadPrefix + vals[i];
+        vals[i] += (warp_prefix - thread_total); // warp_prefix includes this thread_total
     }
 
     // add block prefix
@@ -333,7 +353,6 @@ __global__ void downstream_scan(
         vals[i] = block_prefix + vals[i];
     }
 
-    // write back to x
     for (int i = 0; i < SCAN_VALS_THREAD; i++) {
         int idx = block_offset + threadId * SCAN_VALS_THREAD + i;
         if (idx >= n_circle) {
@@ -341,14 +360,14 @@ __global__ void downstream_scan(
         }
         if (mask[idx]) {
             int write_idx = vals[i] - 1;
-            tile_to_circle_list[write_idx] = idx;
+            tile_to_circle_list[write_idx] = idx % n_circle;
         }
     }
     __syncthreads();
     // first thread writes total count
-    if (blockIdx.x == 0 && threadId == 0) {
-        tile_to_circle_count[tile_id] = blocksums[num_blocks - 1];
-    }
+    // if (blockIdx.x == 0 && threadId == 0) {
+    //     tile_to_circle_count[tile_id] = blocksums[num_blocks - 1];
+    // }
 }
 
 __global__ void render_kernel(
@@ -378,14 +397,14 @@ __global__ void render_kernel(
     float *shircle_green = shircle_red + THREADS_PER_BLOCK;
     float *shircle_blue = shircle_green + THREADS_PER_BLOCK;
     float *shircle_alpha = shircle_blue + THREADS_PER_BLOCK;
-    // per-thread pixel rgb vals
 
-    int num_tiles = num_tiles_x * num_tiles_y;
-    float *thread_pixel_red = shircle_alpha + THREADS_PER_BLOCK;
-    float *thread_pixel_green =
-        thread_pixel_red + THREAD_TILE_DIM * THREAD_TILE_DIM * THREADS_PER_BLOCK;
-    float *thread_pixel_blue =
-        thread_pixel_green + THREAD_TILE_DIM * THREAD_TILE_DIM * THREADS_PER_BLOCK;
+    // per-thread pixel rgb vals
+    // int num_tiles = num_tiles_x * num_tiles_y;
+    // float *thread_pixel_red = shircle_alpha + THREADS_PER_BLOCK;
+    // float *thread_pixel_green =
+    //     thread_pixel_red + THREAD_TILE_DIM * THREAD_TILE_DIM * THREADS_PER_BLOCK;
+    // float *thread_pixel_blue =
+    //     thread_pixel_green + THREAD_TILE_DIM * THREAD_TILE_DIM * THREADS_PER_BLOCK;
 
     int num_circles = circle_count[blockIdx.x]; // number of circles affecting this tile
 
@@ -425,18 +444,6 @@ __global__ void render_kernel(
         img_green_val[i] = 1.0f;
         img_blue_val[i] = 1.0f;
     }
-
-    // int shmem_tile_offset = blockIdx.x * THREAD_TILE_DIM * THREAD_TILE_DIM;
-    // for (int y = 0; y < THREAD_TILE_DIM; y++) {
-    //     for (int x = 0; x < THREAD_TILE_DIM; x++) {
-    //         int shmem_idx = shmem_tile_offset + y * THREAD_TILE_DIM + x;
-    //         thread_pixel_red[shmem_idx] = 1.0f;
-    //         thread_pixel_green[shmem_idx] = 1.0f;
-    //         thread_pixel_blue[shmem_idx] = 1.0f;
-    //     }
-    // }
-    // __syncthreads();
-
     for (int32_t i = 0; i < num_circles; i += THREADS_PER_BLOCK) {
         // each thread loads one circle
         int circle_idx = i + threadId;
@@ -463,14 +470,14 @@ __global__ void render_kernel(
             float pixel_alpha = shircle_alpha[c_idx];
 
             // process the pixels with space in registers (4)
-            for (int y = 0; y < 4; y++) {
-                int x = 0;
+            for (int x = 0; x < 4; x++) {
+                int y = 0;
                 int pixel_x = base_x + x;
                 int pixel_y = base_y + y;
 
-                float pixel_red = img_red_val[y];
-                float pixel_green = img_green_val[y];
-                float pixel_blue = img_blue_val[y];
+                float pixel_red = img_red_val[x];
+                float pixel_green = img_green_val[x];
+                float pixel_blue = img_blue_val[x];
                 // // check if pixel is in circle
                 float dx = pixel_x - c_x;
                 float dy = pixel_y - c_y;
@@ -479,15 +486,15 @@ __global__ void render_kernel(
                     continue;
                 }
 
-                img_red_val[y] =
+                img_red_val[x] =
                     shircle_red[c_idx] * pixel_alpha + pixel_red * (1.0f - pixel_alpha);
-                img_green_val[y] = shircle_green[c_idx] * pixel_alpha +
+                img_green_val[x] = shircle_green[c_idx] * pixel_alpha +
                     pixel_green * (1.0f - pixel_alpha);
-                img_blue_val[y] =
+                img_blue_val[x] =
                     shircle_blue[c_idx] * pixel_alpha + pixel_blue * (1.0f - pixel_alpha);
             }
-            for (int x = 1; x < THREAD_TILE_DIM; x++) {
-                for (int y = 0; y < THREAD_TILE_DIM; y++) {
+            for (int x = 0; x < THREAD_TILE_DIM; x++) {
+                for (int y = 1; y < THREAD_TILE_DIM; y++) {
 
                     int pixel_x = base_x + x;
                     int pixel_y = base_y + y;
@@ -527,13 +534,13 @@ __global__ void render_kernel(
     }
     // write back per-thread pixel rgb vals
 #pragma unroll
-    for (int y = 0; y < 4; y++) {
-        int pixel_y = base_y + y;
-        int pixel_x = base_x;
+    for (int x = 0; x < 4; x++) {
+        int pixel_y = base_y;
+        int pixel_x = base_x + x;
         int pixel_idx = pixel_y * width + pixel_x;
-        img_red[pixel_idx] = img_red_val[y];
-        img_green[pixel_idx] = img_green_val[y];
-        img_blue[pixel_idx] = img_blue_val[y];
+        img_red[pixel_idx] = img_red_val[x];
+        img_green[pixel_idx] = img_green_val[x];
+        img_blue[pixel_idx] = img_blue_val[x];
     }
 }
 
@@ -610,10 +617,11 @@ void launch_render(
                 upstream_workspace);
 
             // spine scan
-            spine_scan<<<
-                spineGridDim,
-                spineBlockDim,
-                THREADS_PER_BLOCK * sizeof(uint32_t)>>>(upstream_workspace);
+            spine_scan<<<spineGridDim, spineBlockDim, upstream_shmem_size_bytes>>>(
+                upstreamGridDim.x,
+                tile_id,
+                upstream_workspace,
+                tile_circle_count);
 
             // downstream scan
             downstream_scan<<<
@@ -625,8 +633,7 @@ void launch_render(
                 tile_id,
                 mask + tile_id * n_circle,
                 upstream_workspace,
-                tile_to_circle_list + tile_id * n_circle,
-                tile_circle_count);
+                tile_to_circle_list + tile_id * n_circle);
         }
     }
     // render tiles
@@ -640,13 +647,6 @@ void launch_render(
         render_kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         shmem_size_bytes));
-
-    // cudaError err = cudaGetLastError();
-    // if (err != cudaSuccess) {
-    //     std::cerr << "CUDA error in launch_render: " << cudaGetErrorString(err)
-    //               << std::endl;
-    //     exit(1);
-    // }
 
     render_kernel<<<renderGridDim, renderBlockDim, shmem_size_bytes>>>(
         n_circle,
